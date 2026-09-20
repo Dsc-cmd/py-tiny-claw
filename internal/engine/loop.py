@@ -1,8 +1,5 @@
 # internal/engine/loop.py
-# 对应 Go 版: internal/engine/loop.go
-# 第 3 章：引入"慢思考"(Thinking Phase)：先剥夺工具强制模型规划，再放开工具让它行动。
 import logging
-
 from internal.provider.interface import LLMProvider
 from internal.schema.message import Message, ROLE_SYSTEM, ROLE_USER
 from internal.tools.registry import Registry
@@ -18,8 +15,8 @@ class AgentEngine:
         self.enable_thinking = enable_thinking
 
     def run(self, user_prompt: str) -> None:
-        log.info("[Engine] 引擎启动，锁定工作区: %s", self.work_dir)
-        log.info("[Engine] 慢思考模式 (Thinking Phase): %s", self.enable_thinking)
+        log.info("[Engine] 引擎启动，工作区: %s", self.work_dir)
+        log.info("[Engine] 慢思考模式: %s", self.enable_thinking)
 
         context_history: list[Message] = [
             Message(
@@ -28,7 +25,7 @@ class AgentEngine:
             ),
             Message(
                 role=ROLE_USER,
-            content=user_prompt,1
+                content=user_prompt,
             ),
         ]
 
@@ -42,9 +39,9 @@ class AgentEngine:
 
             # ================= Phase 1: Thinking =================
             if self.enable_thinking:
-                log.info("[Phase 1] 剥夺工具访问权，强制进入慢思考与规划阶段...")
+                log.info("[Phase 1] 剥夺工具，强制进入慢思考与规划阶段...")
                 try:
-                    think_resp = self.provider.generate(context_history, None)  # 传 None 剥夺工具
+                    think_resp = self.provider.generate(context_history, None)
                 except Exception as e:
                     raise RuntimeError(f"Thinking 阶段失败: {e}")
 

@@ -1,19 +1,21 @@
 # cmd/claw/main.py
 # 对应 Go 版: cmd/claw/main.go
-# 第 3 章：mock Provider 感知"是否持有工具"，演示慢思考(规划) + 行动的两阶段循环。
-# 运行方式（在 py-tiny-claw 目录下）: python -m cmd.claw.main
+# 第 4 章：接入 DeepSeek Provider + MockRegistry（天气工具）
+# 运行方式（在 py-tiny-claw 目录下）:
+#   export DEEPSEEK_API_KEY=your_key  (macOS/Linux)
+#   $env:DEEPSEEK_API_KEY="your_key"  (Windows PowerShell)
+#   python -m cmd.claw.main
 import logging
 import os
 import sys
 from pathlib import Path
 
-# 直接运行本文件时，工作目录和包导入均使用本章目录。
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
 from internal.engine.loop import AgentEngine
-from internal.provider.interface import LLMProvider
+from internal.provider.openai import new_deepseek_provider
 from internal.schema.message import (
     Message,
     ROLE_ASSISTANT,
@@ -26,42 +28,34 @@ from internal.tools.registry import Registry
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y/%m/%d %H:%M:%S")
 
 
-class MockProvider(LLMProvider):
-    def __init__(self):
-        self.turn = 0
-
-
-    def generate(self, msgs, tools):
-        # TODO://# 没有工具可用 => 处于 Thinking 阶段，只输出规划文本
-        if not tools:
-            return Message(role=ROLE_ASSISTANT,
-                           content="【推理中】目标是检查文件。我不能直接盲猜，我需要先调用 bash 执行 ls 看看目录。",
-                           )
-
-        self.turn += 1
-        if self.turn == 1:
-            return Message(
-                role=ROLE_ASSISTANT,
-                content="我要执行我刚才计划的步骤了。",
-                tool_calls=[
-                    ToolCall(id="call_123", name="bash", arguments='{"command": "ls -la"}'),
-                ],
-            )
-
-        return Message(
-            role=ROLE_ASSISTANT,
-            content="根据工具返回的结果，我看到了 main.py，任务圆满完成！",
-        )
-
-
 class MockRegistry(Registry):
+    """模拟天气工具注册表"""
+
     def get_available_tools(self):
-        return [ToolDefinition(name="bash")]
+        return [ToolDefinition(
+            name="get_weather",
+            description="获取指定城市的当前天气情况",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "城市名称，例如：北京、上海"
+                    }
+                },
+                "required": ["city"]
+            }
+        )]
 
     def execute(self, call: ToolCall) -> ToolResult:
+        import json
+        args = json.loads(call.arguments)
+        city = args.get("city", "未知城市")
+        log = logging.getLogger(__name__)
+        log.info("[MockRegistry] 执行工具: %s, 参数: %s", call.name, args)
         return ToolResult(
             tool_call_id=call.id,
-            output="-rw-r--r--  1 user group  234 Oct 24 10:00 main.py\n",
+            output=f"API返回：{city}今天晴天，气温25度，适合户外运动。",
             is_error=False,
         )
 
@@ -69,15 +63,33 @@ class MockRegistry(Registry):
 def main():
     work_dir = os.getcwd()
 
-    p = MockProvider()
-    r = MockRegistry()
+    # 检查 API Key
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        print("错误：请先设置环境变量 DEEPSEEK_API_KEY")
+        print("Windows PowerShell: $env:DEEPSEEK_API_KEY='你的key'")
+        print("macOS/Linux: export DEEPSEEK_API_KEY='你的key'")
+        sys.exit(1)
 
-    eng = AgentEngine(p, r, work_dir, True)
+    # 创建 Provider（接入 DeepSeek）
+    llm_provider = new_deepseek_provider("deepseek-chat")
 
-    try:
-        eng.run("帮我检查当前目录的文件")
-    except Exception as e:
-        sys.exit(f"引擎崩溃: {e}")
+    # 创建 Mock Registry（天气工具）
+    registry = MockRegistry()
+
+    prompt = "我想去北京跑步，帮我查查天气适合吗？"
+
+    print("=" * 60)
+    print("测试 1: EnableThinking = True（慢思考模式）")
+    print("=" * 60)
+    eng = AgentEngine(llm_provider, registry, work_dir, True)
+    eng.run(prompt)
+
+    print("\n")
+    print("=" * 60)
+    print("测试 2: EnableThinking = False（快速模式）")
+    print("=" * 60)
+    eng2 = AgentEngine(llm_provider, registry, work_dir, False)
+    eng2.run(prompt)
 
 
 if __name__ == "__main__":
