@@ -1,147 +1,144 @@
 # internal/provider/openai.py
 # 对应 Go 版: internal/provider/openai.go
-# 第 4 章：接入真实的 OpenAI 兼容协议 Provider（DeepSeek）
-import json
-import logging
+# 使用 OpenAI 官方 Python SDK（Chat Completions 协议），Base URL 指向智谱的兼容端点。
 import os
-import sys
-from openai import OpenAI
 
-from .interface import LLMProvider
-from ..schema.message import Message, ROLE_SYSTEM, ROLE_USER, ROLE_ASSISTANT, ToolCall, ToolDefinition
+import openai
 
-log = logging.getLogger(__name__)
+from internal.provider import interface
+from internal.provider.interface import LLMProvider
+from internal.schema.message import (
+    Message,
+    ROLE_ASSISTANT,
+    ROLE_SYSTEM,
+    ROLE_USER,
+    ToolCall,
+    ToolDefinition,
+)
 
 
 class OpenAIProvider(LLMProvider):
-    """OpenAI 兼容协议的 Provider 实现"""
-
-    def __init__(self, client: OpenAI, model: str):
+    def __init__(self, client: openai.OpenAI, model: str):
         self.client = client
         self.model = model
 
     def generate(self, msgs: list[Message], available_tools: list[ToolDefinition] | None) -> Message:
-        """
-        核心生成逻辑，三步走：
-        1. 内部 Message -> OpenAI 消息格式
-        2. 调用模型 API
-        3. OpenAI 响应 -> 内部 Message
-        """
+        # 1. 把内部统一格式的消息翻译为 OpenAI Chat Completions 的格式
+        openai_msgs = []
 
-        # ==================================================
-        # 第 1 步：内部 Message -> OpenAI 消息格式
-        # ==================================================
-        openai_messages = []
         for msg in msgs:
             if msg.role == ROLE_SYSTEM:
-                openai_messages.append({
-                    "role": "system",
-                    "content": msg.content,
-                })
+                openai_msgs.append({"role": "system", "content": msg.content})
+
             elif msg.role == ROLE_USER:
-                # 工具结果消息需要携带 tool_call_id
-                openai_msg = {"role": "user", "content": msg.content}
-                if msg.tool_call_id:
-                    openai_msg["tool_call_id"] = msg.tool_call_id
-                openai_messages.append(openai_msg)
+                if msg.tool_call_id != "":
+                    # 工具执行结果在 OpenAI 协议中是独立的 "tool" 角色消息
+                    openai_msgs.append({
+                        "role": "tool",
+                        "content": msg.content,
+                        "tool_call_id": msg.tool_call_id,
+                    })
+                else:
+                    openai_msgs.append({"role": "user", "content": msg.content})
+
             elif msg.role == ROLE_ASSISTANT:
-                openai_msg = {"role": "assistant", "content": msg.content}
-                # 处理 tool_calls
-                if msg.tool_calls:
-                    openai_msg["tool_calls"] = []
+                ast_param: dict = {"role": "assistant"}
+
+                if msg.content != "":
+                    ast_param["content"] = msg.content
+
+                if len(msg.tool_calls) > 0:
+                    tool_calls = []
                     for tc in msg.tool_calls:
-                        openai_msg["tool_calls"].append({
+                        tool_calls.append({
                             "id": tc.id,
                             "type": "function",
                             "function": {
                                 "name": tc.name,
+                                # OpenAI 协议中 arguments 本身就是 JSON 字符串
                                 "arguments": tc.arguments,
-                            }
+                            },
                         })
-                openai_messages.append(openai_msg)
+                    ast_param["tool_calls"] = tool_calls
 
-        # ==================================================
-        # 第 2 步：ToolDefinition -> OpenAI tools 格式并调用模型
-        # ==================================================
-        openai_tools = None
-        if available_tools:
-            openai_tools = []
-            for tool in available_tools:
-                openai_tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema or {
-                            "type": "object",
-                            "properties": {},
-                        },
-                    }
-                })
+                openai_msgs.append(ast_param)
 
-        log.info("[OpenAIProvider] 调用模型: %s", self.model)
-        log.info("[OpenAIProvider] 消息数量: %d", len(openai_messages))
+        # 2. 翻译工具定义为 function tool 格式
+        openai_tools = []
+        for tool_def in available_tools or []:
+            params_schema = tool_def.input_schema if isinstance(tool_def.input_schema, dict) else {}
+
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool_def.name,
+                    "description": tool_def.description,
+                    "parameters": params_schema,
+                },
+            })
+
+        params = {
+            "model": self.model,
+            "messages": openai_msgs,
+        }
         if openai_tools:
-            log.info("[OpenAIProvider] 可用工具: %d 个", len(openai_tools))
+            params["tools"] = openai_tools
 
+       ##########################  调用大模型执行  ###############################
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=openai_messages,
-                tools=openai_tools,
-                temperature=0.7,
-            )
+            resp = self.client.chat.completions.create(**params)
         except Exception as e:
-            log.error("[OpenAIProvider] API 调用失败: %s", e)
-            raise
+            raise RuntimeError(f"OpenAI/Zhipu API 请求失败: {e}") from e
+        if len(resp.choices) == 0:
+            raise RuntimeError("API 返回了空的 Choices")
 
-        # ==================================================
-        # 第 3 步：模型响应 -> 内部 Message
-        # ==================================================
-        choice = response.choices[0]
-        message_obj = choice.message
+        # 3. 把模型响应翻译回内部统一格式
+        choice = resp.choices[0].message
+        result_msg = Message(
+            role=ROLE_ASSISTANT,
+            content=choice.content or "",
+        )
 
-        # 提取 content
-        content = message_obj.content or ""
-
-        # 提取 tool_calls
-        tool_calls = []
-        if message_obj.tool_calls:
-            for tc in message_obj.tool_calls:
-                tool_calls.append(ToolCall(
+        for tc in choice.tool_calls or []:
+            if tc.type == "function":
+                result_msg.tool_calls.append(ToolCall(
                     id=tc.id,
                     name=tc.function.name,
                     arguments=tc.function.arguments,
                 ))
 
-        result_msg = Message(
-            role=ROLE_ASSISTANT,
-            content=content,
-            tool_calls=tool_calls,
-        )
-
-        log.info("[OpenAIProvider] 响应内容: %s", content[:100] if content else "(无内容)")
-        if tool_calls:
-            log.info("[OpenAIProvider] 工具调用: %d 个", len(tool_calls))
-
         return result_msg
 
 
-def new_deepseek_provider(model: str = "deepseek-chat") -> OpenAIProvider:
-    """
-    构造 DeepSeek Provider。
-    DeepSeek 兼容 OpenAI 协议，复用 OpenAIProvider。
+def new_zhipu_openai_provider(model: str) -> OpenAIProvider:
+    """对应 Go 版的 NewZhipuOpenAIProvider 构造函数"""
+    api_key = os.getenv("ZHIPU_API_KEY")
+    if not api_key:
+        raise RuntimeError("请设置 ZHIPU_API_KEY 环境变量")
+    base_url = "https://open.bigmodel.cn/api/paas/v4/"
+    return OpenAIProvider(
+        client=openai.OpenAI(api_key=api_key, base_url=base_url),
+        model=model,
+    )
+
+
+def new_deepseek_provider(model: str) -> OpenAIProvider:
+    """DeepSeek 官方 API。
+
+    DeepSeek 走的同样是 OpenAI Chat Completions 兼容协议，
+    所以上面那套消息与工具翻译逻辑可以原样复用，只需换 Base URL 与密钥。
+    可用模型：deepseek-v4-flash（快、便宜）、deepseek-v4-pro（更强）。
     """
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
-        sys.exit("错误：请先设置环境变量 DEEPSEEK_API_KEY")
-
-    log.info("[DeepSeek] 初始化 Provider, model=%s", model)
-    log.info("[DeepSeek] API Base: https://api.deepseek.com")
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com",
+        raise RuntimeError(
+            "请设置 DEEPSEEK_API_KEY 环境变量"
+            "（也可以写进项目根目录的 .env 文件，会被自动加载）"
+        )
+    base_url = "https://api.deepseek.com/v1"
+    return OpenAIProvider(
+        client=openai.OpenAI(api_key=api_key, base_url=base_url),
+        model=model,
     )
 
-    return OpenAIProvider(client, model)
+

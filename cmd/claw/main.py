@@ -1,95 +1,63 @@
 # cmd/claw/main.py
-# 对应 Go 版: cmd/claw/main.go
-# 第 4 章：接入 DeepSeek Provider + MockRegistry（天气工具）
-# 运行方式（在 py-tiny-claw 目录下）:
-#   export DEEPSEEK_API_KEY=your_key  (macOS/Linux)
-#   $env:DEEPSEEK_API_KEY="your_key"  (Windows PowerShell)
-#   python -m cmd.claw.main
+# 第 6 章：挂载 read_file / write_file / bash / edit_file 四大原语，
+# 用一次综合任务验证 Tool Registry 的分发能力。
+# 运行方式（在 py-tiny-claw 目录下）: python -m cmd.claw.main
 import logging
 import os
 import sys
 from pathlib import Path
 
+# PyCharm 直接运行脚本时，优先导入本章包，避免其他章节的源码根目录干扰。
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
 from internal.engine.loop import AgentEngine
 from internal.provider.openai import new_deepseek_provider
-from internal.schema.message import (
-    Message,
-    ROLE_ASSISTANT,
-    ToolCall,
-    ToolDefinition,
-    ToolResult,
-)
-from internal.tools.registry import Registry
+from internal.tools.bash import BashTool
+from internal.tools.edit_file import EditFileTool
+from internal.tools.read_file import ReadFileTool
+from internal.tools.registry import new_registry
+from internal.tools.write_file import WriteFileTool
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y/%m/%d %H:%M:%S")
 
 
-class MockRegistry(Registry):
-    """模拟天气工具注册表"""
-
-    def get_available_tools(self):
-        return [ToolDefinition(
-            name="get_weather",
-            description="获取指定城市的当前天气情况",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名称，例如：北京、上海"
-                    }
-                },
-                "required": ["city"]
-            }
-        )]
-
-    def execute(self, call: ToolCall) -> ToolResult:
-        import json
-        args = json.loads(call.arguments)
-        city = args.get("city", "未知城市")
-        log = logging.getLogger(__name__)
-        log.info("[MockRegistry] 执行工具: %s, 参数: %s", call.name, args)
-        return ToolResult(
-            tool_call_id=call.id,
-            output=f"API返回：{city}今天晴天，气温25度，适合户外运动。",
-            is_error=False,
-        )
-
-
 def main():
-    work_dir = os.getcwd()
-
-    # 检查 API Key
     if not os.getenv("DEEPSEEK_API_KEY"):
-        print("错误：请先设置环境变量 DEEPSEEK_API_KEY")
-        print("Windows PowerShell: $env:DEEPSEEK_API_KEY='你的key'")
-        print("macOS/Linux: export DEEPSEEK_API_KEY='你的key'")
-        sys.exit(1)
+        sys.exit("请先配置 DEEPSEEK_API_KEY 环境变量")
 
-    # 创建 Provider（接入 DeepSeek）
-    llm_provider = new_deepseek_provider("deepseek-chat")
+    # 把 Agent 的活动范围锁定在 workspace/ 子目录，避免模型生成的文件弄乱项目代码
+    work_dir = PROJECT_ROOT / "workspace"
+    work_dir.mkdir(exist_ok=True)
+    work_dir = str(work_dir)
 
-    # 创建 Mock Registry（天气工具）
-    registry = MockRegistry()
+    llm_provider = new_deepseek_provider("deepseek-v4-flash")
 
-    prompt = "我想去北京跑步，帮我查查天气适合吗？"
+    # 1. 创建注册中心，挂载四大原语
+    registry = new_registry()
+    registry.register(ReadFileTool(work_dir))
+    registry.register(WriteFileTool(work_dir))
+    registry.register(BashTool(work_dir))
+    registry.register(EditFileTool(work_dir))
 
-    print("=" * 60)
-    print("测试 1: EnableThinking = True（慢思考模式）")
-    print("=" * 60)
-    eng = AgentEngine(llm_provider, registry, work_dir, True)
-    eng.run(prompt)
+    # 2. 为节省 token，本实验关闭慢思考模式
+    eng = AgentEngine(llm_provider, registry, work_dir, False)
 
-    print("\n")
-    print("=" * 60)
-    print("测试 2: EnableThinking = False（快速模式）")
-    print("=" * 60)
-    eng2 = AgentEngine(llm_provider, registry, work_dir, False)
-    eng2.run(prompt)
+    # 3. 一个需要四大原语协作的综合任务
+    prompt = """
+请按顺序完成以下操作，每一步都使用对应的工具：
+1. 用 write_file 创建 calc.py，内容是一个函数 add(a, b) 返回 a + b，并在文件末尾 print(add(2, 3))
+2. 用 bash 执行 python calc.py
+3. 用 edit_file 把 return a + b 改成 return a * b
+4. 用 read_file 读取 calc.py 确认修改成功
+5. 再用 bash 执行一次 python calc.py，告诉我两次输出分别是多少
+"""
+
+    try:
+        eng.run(prompt)
+    except Exception as e:
+        sys.exit(f"引擎运行崩溃: {e}")
 
 
 if __name__ == "__main__":
