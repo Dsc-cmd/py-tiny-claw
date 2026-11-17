@@ -1,0 +1,14 @@
+# 密钥文件：绝对不要提交
+.env
+*.env
+
+# Agent 实验时的工作区（模型生成的文件）
+workspace/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# IDE 配置
+.idea/
+.vscode/
